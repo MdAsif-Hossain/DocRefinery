@@ -1,0 +1,4 @@
+clean_pdfs/
+raw_pdfs/
+__pycache__/
+*.pdf
