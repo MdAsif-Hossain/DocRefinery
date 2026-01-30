@@ -1,9 +1,8 @@
 import fitz  # PyMuPDF
 from reportlab.lib.pagesizes import letter
-from reportlab.pdfgen import canvas
-from reportlab.lib.utils import simpleSplit
-from reportlab.lib import colors
-from datetime import datetime
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_JUSTIFY, TA_CENTER, TA_LEFT
 import os
 import glob
 import re
@@ -12,199 +11,174 @@ import re
 INPUT_FOLDER = "raw_pdfs"
 OUTPUT_FOLDER = "clean_pdfs"
 
-class PDFSanitizer:
+class PDFSanitizerPro:
     def __init__(self, input_path, output_path):
         self.input_path = input_path
         self.output_path = output_path
         self.doc = fitz.open(input_path)
-        self.clean_paragraphs = [] # Stores text blocks to write
+        self.story = [] # Holds all the 'Flowables' (Text blocks)
+        
+        # --- Define Professional Styles ---
+        styles = getSampleStyleSheet()
+        
+        # 1. Main Header (Bold, Centered, Big)
+        self.style_header = ParagraphStyle(
+            'Header1',
+            parent=styles['Heading1'],
+            fontSize=14,
+            leading=18, # Line height
+            alignment=TA_CENTER,
+            spaceAfter=12,
+            fontName='Helvetica-Bold'
+        )
+        
+        # 2. Sub Header (Bold, Left Aligned)
+        self.style_subheader = ParagraphStyle(
+            'Header2',
+            parent=styles['Heading2'],
+            fontSize=11,
+            leading=14,
+            alignment=TA_LEFT,
+            spaceAfter=6,
+            fontName='Helvetica-Bold'
+        )
+        
+        # 3. List Item (Hanging Indent)
+        self.style_list = ParagraphStyle(
+            'ListItem',
+            parent=styles['BodyText'],
+            fontSize=10,
+            leading=12,
+            leftIndent=20,
+            firstLineIndent=0, # Keeps the bullet/number at the edge
+            alignment=TA_JUSTIFY,
+            spaceAfter=3
+        )
+
+        # 4. Standard Body (Justified, Clean)
+        self.style_body = ParagraphStyle(
+            'Body',
+            parent=styles['BodyText'],
+            fontSize=10,
+            leading=13, # Comfortable reading height
+            alignment=TA_JUSTIFY,
+            spaceAfter=6
+        )
 
     def is_junk_page(self, text, page_num):
-        """Detects Covers, Indexes, or blank pages."""
-        text_lower = text.lower()
-        if page_num == 0: return True # Always skip Cover
-        
-        junk_keywords = ["table of contents", "index", "acknowledgement", "preface"]
-        # Check for dots pattern (common in TOC)
+        if page_num == 0: return True
+        junk = ["table of contents", "index", "acknowledgement", "preface"]
         if text.count("....") > 5: return True
-        
-        # Check for keywords in header
-        header = text_lower[:300]
-        for k in junk_keywords:
-            if k in header: return True
-            
-        return False
+        return any(k in text.lower()[:300] for k in junk)
 
     def extract_smart_layout(self, page):
         """
-        Detects 1-column vs 2-column layout dynamically.
-        Returns text sorted in reading order.
+        Extracts blocks and sorts them intelligently (Columns -> Reading Order).
         """
         blocks = page.get_text("blocks")
-        # Filter: exclude images (type 1) and tiny text
+        # Filter noise: Images (type 1) and empty strings
         text_blocks = [b for b in blocks if b[6] == 0 and len(b[4].strip()) > 1]
         
-        if not text_blocks: return ""
+        if not text_blocks: return []
 
         page_width = page.rect.width
         mid_point = page_width / 2
         
-        # Check if 2-Column: Do we have text starting on the Right Half?
+        # Detect Columns
         has_right_col = any(b[0] > (mid_point + 20) for b in text_blocks)
         
         if has_right_col:
-            # Sort: Left Col (Top-Down) -> Right Col (Top-Down)
-            left_col = [b for b in text_blocks if b[0] < mid_point]
-            right_col = [b for b in text_blocks if b[0] >= mid_point]
-            
-            left_col.sort(key=lambda x: x[1])
-            right_col.sort(key=lambda x: x[1])
-            
-            sorted_blocks = left_col + right_col
+            left = [b for b in text_blocks if b[0] < mid_point]
+            right = [b for b in text_blocks if b[0] >= mid_point]
+            left.sort(key=lambda x: x[1])
+            right.sort(key=lambda x: x[1])
+            sorted_blocks = left + right
         else:
-            # Sort: Strict Top-Down
             text_blocks.sort(key=lambda x: x[1])
             sorted_blocks = text_blocks
 
-        # Return joined text
-        return "\n".join([b[4].strip() for b in sorted_blocks])
+        # Return LIST of strings (Paragraphs), not one giant string
+        return [b[4].strip() for b in sorted_blocks]
 
-    def clean_noise(self, text):
-        """
-        Removes old page numbers and headers from the raw text stream.
-        """
+    def clean_text_block(self, text):
+        """Removes Footer/Header noise inside the text block."""
         lines = text.split('\n')
-        cleaned_lines = []
+        clean_lines = []
         for line in lines:
-            # Remove "Page X of Y" or "December 24, 2024" type lines
-            if re.search(r'Page \d+ of \d+', line) or re.search(r'Tuesday, December', line):
-                continue
-            if len(line) < 4: # Remove tiny artifacts
-                continue
-            cleaned_lines.append(line)
-        return cleaned_lines
+            # aggressive footer filter
+            if re.search(r'Page \d+ of \d+', line): continue
+            if "Tuesday, December" in line: continue
+            if len(line.strip()) < 3: continue 
+            
+            # Merge hyphenated words (e.g., "bacter- ia" -> "bacteria")
+            if line.endswith("-"):
+                line = line[:-1]
+                
+            clean_lines.append(line)
+            
+        return " ".join(clean_lines) # Merge lines back into a single flowing paragraph
 
-    def analyze_structure(self, line):
-        """
-        Decides the Formatting (Bold, Indent) based on Regex patterns.
-        Matches the style of your 'Gold Standard' documents.
-        """
-        # 1. MAIN HEADER (e.g., "1. TITLE", "5. MISCONDUCT")
-        # Pattern: Start with number + dot + CAPS or specific Keywords
-        if re.match(r'^\d+\.\s+[A-Z\s]+$', line) or line in ["PREAMBLE", "STATUTE"]:
-            return "HEADER_1"
+    def analyze_style(self, text):
+        """Decides which Style Object to use."""
+        # Main Header: Starts with number, short, CAPS or Title Case
+        if (re.match(r'^\d+\.\s+', text) and len(text) < 80) or text.isupper():
+            return self.style_header
         
-        # 2. SUB HEADER (e.g., "2.1 Definition", "4.2.1")
-        if re.match(r'^\d+\.\d+(\.\d+)?\s+', line):
-            return "HEADER_2"
+        # Sub Header: 2.1, 2.1.3
+        if re.match(r'^\d+\.\d+', text) and len(text) < 100:
+            return self.style_subheader
             
-        # 3. LIST ITEM (e.g., "(a)", "(i)", "a.")
-        if re.match(r'^(\([a-z0-9]+\)|[a-z]\.)\s+', line):
-            return "LIST_ITEM"
+        # List Item: (a), (i), 1.
+        if re.match(r'^(\(?\w+\)?|\d+\.)\s+', text):
+            return self.style_list
             
-        return "NORMAL"
-
-    def create_clean_pdf(self):
-        """Writes the structured PDF using ReportLab."""
-        c = canvas.Canvas(self.output_path, pagesize=letter)
-        width, height = letter
-        margin_left = 50
-        margin_right = 50
-        max_width = width - (margin_left + margin_right)
-        
-        y = height - 50 # Start position
-        page_num = 1
-        
-        def draw_footer():
-            c.setFont("Helvetica", 9)
-            c.setFillColor(colors.grey)
-            date_str = datetime.now().strftime("%A, %B %d, %Y")
-            c.drawString(margin_left, 30, date_str)
-            c.drawRightString(width - margin_right, 30, f"Page {page_num} of ?")
-            c.setFillColor(colors.black) # Reset
-
-        for line in self.clean_paragraphs:
-            # Check for Page Break
-            if y < 60: 
-                draw_footer()
-                c.showPage()
-                y = height - 50
-                page_num += 1
-
-            # Get Style
-            style = self.analyze_structure(line)
-            
-            # Apply Style Settings
-            if style == "HEADER_1":
-                c.setFont("Helvetica-Bold", 14)
-                indent = 0
-                y -= 10 # Extra space before header
-            elif style == "HEADER_2":
-                c.setFont("Helvetica-Bold", 11)
-                indent = 15
-                y -= 5
-            elif style == "LIST_ITEM":
-                c.setFont("Helvetica", 11)
-                indent = 35
-            else: # Normal
-                c.setFont("Helvetica", 11)
-                indent = 0
-
-            # Wrap Text (Handling long lines)
-            wrapped_lines = simpleSplit(line, c._fontname, c._fontsize, max_width - indent)
-            
-            for w_line in wrapped_lines:
-                if y < 60: # Check break inside a paragraph
-                    draw_footer()
-                    c.showPage()
-                    y = height - 50
-                    page_num += 1
-                    # Restore font after page break
-                    if style == "HEADER_1": c.setFont("Helvetica-Bold", 14)
-                    elif style == "HEADER_2": c.setFont("Helvetica-Bold", 11)
-                    else: c.setFont("Helvetica", 11)
-
-                c.drawString(margin_left + indent, y, w_line)
-                y -= 14 # Line spacing
-            
-            y -= 4 # Paragraph spacing
-
-        draw_footer()
-        c.save()
+        return self.style_body
 
     def sanitize(self):
-        # 1. Read & Process All Pages
         for page_num in range(len(self.doc)):
             page = self.doc.load_page(page_num)
-            raw_text = page.get_text("text") # Quick check
+            raw_text = page.get_text("text") 
             
-            if self.is_junk_page(raw_text, page_num):
-                continue
+            if self.is_junk_page(raw_text, page_num): continue
+            
+            # Get Blocks (List of Paragraphs)
+            blocks = self.extract_smart_layout(page)
+            
+            for block in blocks:
+                # 1. Clean content
+                clean_content = self.clean_text_block(block)
+                if not clean_content: continue
                 
-            # Smart Extract (Fixes Columns)
-            ordered_text = self.extract_smart_layout(page)
-            
-            # Clean Noise & Store
-            clean_lines = self.clean_noise(ordered_text)
-            self.clean_paragraphs.extend(clean_lines)
-            
-        # 2. Generate PDF
-        if self.clean_paragraphs:
-            self.create_clean_pdf()
+                # 2. Pick Style
+                style_to_use = self.analyze_style(clean_content)
+                
+                # 3. Create Paragraph Flowable
+                para = Paragraph(clean_content, style_to_use)
+                self.story.append(para)
+
+        # Build PDF
+        if self.story:
+            doc = SimpleDocTemplate(
+                self.output_path,
+                pagesize=letter,
+                rightMargin=50, leftMargin=50,
+                topMargin=50, bottomMargin=50
+            )
+            doc.build(self.story)
 
 # --- Batch Runner ---
 def run_batch():
     if not os.path.exists(OUTPUT_FOLDER): os.makedirs(OUTPUT_FOLDER)
     files = glob.glob(os.path.join(INPUT_FOLDER, "*.pdf"))
     
-    print(f"🚀 Found {len(files)} PDFs. Processing...")
+    print(f"🚀 Processing {len(files)} PDFs using Pro Typesetting...")
     
     for f in files:
         name = os.path.basename(f)
-        out_name = os.path.join(OUTPUT_FOLDER, "Cleaned_" + name)
-        print(f"   - Processing: {name} ...", end=" ")
+        out_name = os.path.join(OUTPUT_FOLDER, "Pro_" + name)
         try:
-            s = PDFSanitizer(f, out_name)
+            print(f"   - {name}...", end=" ")
+            s = PDFSanitizerPro(f, out_name)
             s.sanitize()
             print("✅ Done")
         except Exception as e:
