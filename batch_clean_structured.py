@@ -33,7 +33,7 @@ class RAGSanitizer:
 
     def clean_text_rag_optimized(self, text):
         """
-        The Master Cleaner: Removes artifacts, symbols, and specific noise patterns.
+        The Master Cleaner: Removes artifacts, symbols, watermarks, and contact info.
         """
         # 1. Remove tags
         text = re.sub(r'\\', '', text)
@@ -44,14 +44,14 @@ class RAGSanitizer:
         # 3. Fix Encoding/Symbols
         text = text.replace('©', '')     # Remove copyright symbol entirely
         text = text.replace('\xa0', ' ') # Fix non-breaking spaces
-        
-        # --- THE FIX IS HERE ---
-        # We use .replace() instead of re.sub() for backslashes to avoid the SyntaxError
-        text = text.replace('\\', '')    
+        text = text.replace('\\', '')    # Remove backslashes safely
         
         lines = text.split('\n')
         cleaned_lines = []
         
+        # Flag to detect if we hit the "Contact Us" section
+        hit_footer_section = False
+
         for line in lines:
             stripped = line.strip()
             
@@ -60,11 +60,10 @@ class RAGSanitizer:
             # A. Remove empty or tiny lines
             if len(stripped) < 3: continue
             
-            # B. Remove specific Repeating Watermarks
-            # Matches: "AKW", "(c) AKW", "AKW AKW", "© AKW"
+            # B. Remove Repeating Watermarks "AKW"
             if re.match(r'^(\(?c\)?\s*AKW\s*)+$', stripped, re.IGNORECASE):
                 continue
-                
+            
             # C. Remove "FAO, Yangon" footers
             if "FAO" in stripped and "Yangon" in stripped: continue
             
@@ -74,7 +73,31 @@ class RAGSanitizer:
             # E. Remove Date/Page lines
             if "Page" in stripped and "of" in stripped: continue
             if "Tuesday, December" in stripped: continue
+
+            # --- F. NEW: REMOVE CONTACT / FEEDBACK SECTION ---
+            # If we see the start of the feedback section, we trigger a flag or skip
             
+            # Detect the start phrase
+            if "We want to hear from you" in stripped:
+                hit_footer_section = True
+                continue # Skip this line
+            
+            # Detect specific names/numbers in that block
+            if "Daw Nu Nu Lwin" in stripped or "U Aung Thein" in stripped: continue
+            if "09 893" in stripped or "09 894" in stripped: continue
+            if "@fao.org" in stripped: continue
+            if "Pictures on cover by" in stripped: continue
+            
+            # Detect the broken "Time : 8:30" lines
+            if "Time" in stripped and "8:30" in stripped: continue
+            if "Monday" in stripped and "Friday" in stripped: continue
+
+            # If it's just a stray number from the phone list (e.g., "091", "090")
+            if stripped.isdigit() and len(stripped) < 5: continue
+            
+            # If it's a stray name part like "U", "Aung", "Ko" appearing on its own line
+            if stripped in ["U", "Aung", "Ko", "Win"]: continue
+
             cleaned_lines.append(stripped)
             
         return "\n".join(cleaned_lines)
