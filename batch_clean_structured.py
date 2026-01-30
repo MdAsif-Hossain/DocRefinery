@@ -27,7 +27,8 @@ class RAGSanitizer:
         )
         self.style_header = ParagraphStyle(
             'Header', parent=self.styles['Heading2'],
-            fontSize=12, leading=16, spaceAfter=4, textColor=colors.darkblue
+            fontSize=12, leading=16, spaceAfter=4, textColor=colors.darkblue,
+            fontName='Helvetica-Bold'
         )
 
     def clean_text_rag_optimized(self, text):
@@ -35,25 +36,42 @@ class RAGSanitizer:
         The Master Cleaner: Removes artifacts, symbols, and specific noise patterns.
         """
         # 1. Remove tags
-        text = text.replace('\\', '')
+        text = re.sub(r'\\', '', text)
         
         # 2. Remove Page Markers "--- PAGE 1 ---"
         text = re.sub(r'---\s*PAGE\s*\d+\s*---', '', text)
         
         # 3. Fix Encoding/Symbols
-        text = text.replace('©', '(c)')  # Fix copyright symbol
+        text = text.replace('©', '')     # Remove copyright symbol entirely
         text = text.replace('\xa0', ' ') # Fix non-breaking spaces
         
-        # 4. Remove Watermarks/Initials (lines that are just "AKW" or "CD1098EN")
+        # --- THE FIX IS HERE ---
+        # We use .replace() instead of re.sub() for backslashes to avoid the SyntaxError
+        text = text.replace('\\', '')    
+        
         lines = text.split('\n')
         cleaned_lines = []
+        
         for line in lines:
             stripped = line.strip()
-            # Skip empty or tiny meaningless lines
-            if len(stripped) < 3: continue
-            if stripped in ["AKW", "AKW AKW", "CD1098EN/1/06.24"]: continue 
             
-            # Skip Footer/Header noise
+            # --- AGGRESSIVE NOISE FILTERS ---
+            
+            # A. Remove empty or tiny lines
+            if len(stripped) < 3: continue
+            
+            # B. Remove specific Repeating Watermarks
+            # Matches: "AKW", "(c) AKW", "AKW AKW", "© AKW"
+            if re.match(r'^(\(?c\)?\s*AKW\s*)+$', stripped, re.IGNORECASE):
+                continue
+                
+            # C. Remove "FAO, Yangon" footers
+            if "FAO" in stripped and "Yangon" in stripped: continue
+            
+            # D. Remove File codes / Copyright lines
+            if stripped in ["CD1098EN/1/06.24", "AKW", "FAO, 2024"]: continue
+            
+            # E. Remove Date/Page lines
             if "Page" in stripped and "of" in stripped: continue
             if "Tuesday, December" in stripped: continue
             
@@ -63,30 +81,28 @@ class RAGSanitizer:
 
     def detect_and_format_table(self, text_block):
         """
-        Heuristic to detect if a text block is actually a table.
-        If yes, formats it as a ReportLab Table (which RAG engines read better).
+        Heuristic to detect tables (like the Salinity table) and format them as Grids.
         """
         lines = text_block.split('\n')
         
-        # Heuristic: If multiple lines have similar spacing or structure (like "Value... Value... Value")
-        # For this specific PDF, we look for the "Salinity" table pattern
+        # Specific Check for the FAO "Salinity" table pattern
         if "No problem" in text_block and "Severe problems" in text_block:
-            # We found the specific Salinity table! Let's hard-code the fix for this known structure
-            # Or use a generic splitter. Let's try a generic splitter based on spacing.
             data = []
             for line in lines:
-                # Split by 2+ spaces (assuming visual separation)
+                # Split by 2+ spaces (visual column separation)
                 cols = re.split(r'\s{2,}', line.strip())
                 if len(cols) > 1:
                     data.append(cols)
             
             if len(data) > 2:
-                # It's a table!
-                t = Table(data, colWidths=[150, 100, 100, 100]) # Approx widths
+                # It's a table! Create a ReportLab Table Object
+                t = Table(data, colWidths=[150, 100, 100, 100])
                 t.setStyle(TableStyle([
                     ('GRID', (0,0), (-1,-1), 0.5, colors.grey),
-                    ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'), # Header bold
+                    ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'), # Bold Header
                     ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),
+                    ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+                    ('FONTSIZE', (0,0), (-1,-1), 9),
                 ]))
                 return t
         
@@ -95,13 +111,12 @@ class RAGSanitizer:
     def sanitize(self):
         for page_num in range(len(self.doc)):
             page = self.doc.load_page(page_num)
-            raw_text = page.get_text("text") # Extract raw text
+            raw_text = page.get_text("text") 
             
             # 1. Clean the text
             clean_text = self.clean_text_rag_optimized(raw_text)
             
-            # 2. Split into semantic blocks (Paragraphs)
-            # We split by double newline to separate headers from body
+            # 2. Split into semantic blocks (Paragraphs) by double newline
             paragraphs = clean_text.split('\n\n')
             
             for para_text in paragraphs:
@@ -116,15 +131,19 @@ class RAGSanitizer:
                     continue
                 
                 # 4. Determine Style (Header vs Body)
-                # If short and no period at end, likely a Header
                 if len(para_text) < 100 and not para_text.endswith('.'):
                     style = self.style_header
                 else:
                     style = self.style_body
                 
                 # 5. Create Paragraph
-                p = Paragraph(para_text, style)
-                self.story.append(p)
+                try:
+                    p = Paragraph(para_text, style)
+                    self.story.append(p)
+                except:
+                    # Fallback for weird characters
+                    p = Paragraph(para_text, self.style_body)
+                    self.story.append(p)
 
         # Build PDF
         if self.story:
